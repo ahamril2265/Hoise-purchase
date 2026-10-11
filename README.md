@@ -33,6 +33,27 @@ A property missing any must-have can't score above 4. Each card has a **Why this
 You can also pin your own score on any property; the card then shows a star, and the breakdown still shows the calculated score.
 Tweak the weights, the cap and the budget tolerance at the top of `public/app.js`.
 
+## Photos and descriptions
+
+Each property can have a description and up to 12 photos; the first photo is the cover (use ★ to change it).
+Photos are resized in your browser before upload (to 1600px, typically 100–400 KB each) and stored in the
+Neon database, so they're only visible after signing in. Neon's free plan includes 0.5 GB, which is room for
+well over a thousand photos at that size. Deleting a property also deletes its photos.
+
+## Map
+
+The dashboard map shows every property that has a map location, as a pin coloured by match score.
+Search and the type filter apply to the map too. Tap a pin for its photo, price and score, plus Directions.
+
+Set a property's location in its edit form: paste coordinates or a full Google Maps link, use
+**Find from location** (looks up the typed location on OpenStreetMap), **Use my current location**,
+or click the map and drag the pin. Map tiles come from OpenStreetMap; Leaflet is served from `public/vendor/leaflet`.
+
+## Updates never remove your data
+
+Database changes in new versions only ever add tables or columns, applied automatically on the next request.
+Existing properties, photos, preferences and your password are left as they are.
+
 ## Forgot the password?
 
 In the Neon console (Vercel → Storage → your database → **Open in Neon** → SQL Editor), run:
@@ -56,5 +77,6 @@ saved to `.pglite/`, so you don't need a database account to try it. Set `DATABA
 
 ## Customising
 
-- **Currency symbol:** set `CURRENCY` at the top of `public/app.js` (e.g. `'USD'`, `'GBP'`, `'AED'`).
+- **Numbers** use the Indian system (12,34,56,789, with lakh/crore labels). Change `NUMBER_LOCALE` at the top of `public/app.js` for another format.
+- **Currency symbol:** set `CURRENCY` at the top of `public/app.js` (e.g. `'INR'` for ₹, `'AED'`, `'USD'`).
 - **Property types:** edit `PROPERTY_TYPES` in `api/index.js`.

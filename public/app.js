@@ -1,7 +1,9 @@
 'use strict';
 
-// Set to a currency code such as 'USD', 'GBP', 'EUR', 'AED' or 'INR' to show a symbol with prices.
+// Set to a currency code such as 'INR', 'AED' or 'USD' to show a symbol with prices.
 const CURRENCY = '';
+// Indian number system: 12,34,56,789 grouping, with lakh/crore labels for large amounts.
+const NUMBER_LOCALE = 'en-IN';
 
 // How much each preference counts towards the match score.
 const IMPORTANCE = {
@@ -18,6 +20,11 @@ const FEATURE_SUGGESTIONS = [
   'Near schools', 'Near transport', 'Move-in ready', 'Quiet street',
 ];
 
+// Photos are resized in the browser before upload: a large JPEG for viewing and a small one for cards.
+const MAX_PHOTOS = 12;
+const PHOTO_MAX_SIDE = 1600;
+const THUMB_MAX_SIDE = 480;
+
 const TRASH_SVG = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10"/></svg>';
 const PIN_SVG = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.8l2.1 4.4 4.8.6-3.5 3.3.9 4.8L10 13.6l-4.3 2.3.9-4.8-3.5-3.3 4.8-.6z"/></svg>';
 
@@ -30,6 +37,13 @@ const state = {
   draftPrefs: null,
   editingId: null,
   deletingId: null,
+  // Photo edits in the open property dialog; applied when it's saved.
+  photoDraft: [], // { id } for saved photos, { full, thumb, url } for new ones
+  photoOriginal: [],
+  removedPhotoIds: [],
+  photosProcessing: 0,
+  viewer: { ids: [], index: 0, name: '' },
+  formCoords: null, // { lat, lng } chosen in the open property dialog
 };
 
 function emptyPreferences() {
@@ -42,10 +56,26 @@ function emptyPreferences() {
 }
 
 const priceFormatter = new Intl.NumberFormat(
-  undefined,
+  NUMBER_LOCALE,
   CURRENCY ? { style: 'currency', currency: CURRENCY, maximumFractionDigits: 0 } : { maximumFractionDigits: 0 },
 );
 const formatPrice = (value) => priceFormatter.format(value);
+const shortNumber = new Intl.NumberFormat(NUMBER_LOCALE, { maximumFractionDigits: 2 });
+
+/** 12500000 → "1.25 crore", 450000 → "4.5 lakh"; '' below one lakh. */
+function amountInWords(value) {
+  if (!Number.isFinite(value) || value < 1e5) return '';
+  return value >= 1e7 ? `${shortNumber.format(value / 1e7)} crore` : `${shortNumber.format(value / 1e5)} lakh`;
+}
+
+/** Live "12,34,567 · 12.35 lakh" hint under an amount input. */
+function updateAmountHint(input) {
+  const hint = document.getElementById(input.dataset.amountHint);
+  const value = input.value === '' ? NaN : Number(input.value);
+  hint.textContent = Number.isFinite(value) && value > 0
+    ? [formatPrice(value), amountInWords(value)].filter(Boolean).join(' · ')
+    : '';
+}
 const scoreLevel = (score) => (score === null ? 'none' : score >= 8 ? 'high' : score >= 5 ? 'mid' : 'low');
 
 function el(tag, props = {}, ...children) {
@@ -58,6 +88,236 @@ function svg(markup) {
   const template = document.createElement('template');
   template.innerHTML = markup;
   return template.content.firstElementChild;
+}
+
+// ---------- Photos ----------
+
+const photoUrl = (id, thumb = false) => `/api?route=${encodeURIComponent(`photos/${id}${thumb ? '/thumb' : ''}`)}`;
+
+function toJpeg(bitmap, maxSide, quality) {
+  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff'; // transparent PNGs get a white background instead of black
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve, reject) => canvas.toBlob(
+    (blob) => (blob ? resolve(blob) : reject(new Error('Could not encode image.'))), 'image/jpeg', quality));
+}
+
+async function resizePhoto(file) {
+  const bitmap = await createImageBitmap(file);
+  try {
+    return { full: await toJpeg(bitmap, PHOTO_MAX_SIDE, 0.82), thumb: await toJpeg(bitmap, THUMB_MAX_SIDE, 0.72) };
+  } finally {
+    bitmap.close();
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// ---------- Maps ----------
+// Leaflet with OpenStreetMap tiles (darkened with a CSS filter in dark mode). Both maps are created lazily.
+
+const maps = { dashboard: null, markers: null, fittedKey: '', picker: null, pin: null };
+
+const hasCoords = (p) => p.latitude !== null && p.latitude !== undefined && p.longitude !== null && p.longitude !== undefined;
+const directionsUrl = (p) => `https://www.google.com/maps/dir/?api=1&destination=${p.latitude},${p.longitude}`;
+
+function addTiles(map) {
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+  }).addTo(map);
+}
+
+function createMap(container) {
+  // Scroll-wheel zoom only after the map is clicked, so scrolling the page doesn't get trapped.
+  const map = L.map(container, { scrollWheelZoom: false, worldCopyJump: true });
+  map.on('click focus', () => map.scrollWheelZoom.enable());
+  map.on('mouseout blur', () => map.scrollWheelZoom.disable());
+  addTiles(map);
+  return map;
+}
+
+// Score is a number or null, so this markup never contains user text.
+const pinIcon = (score, extraClass = '') => L.divIcon({
+  className: `pin pin-${scoreLevel(score)} ${extraClass}`,
+  html: `<span><b>${score ?? (extraClass ? '' : '–')}</b></span>`,
+  iconSize: [34, 34],
+  iconAnchor: [17, 34],
+  popupAnchor: [0, -32],
+});
+
+function popupContent({ p, score }) {
+  const box = el('div', { className: 'map-popup' });
+  if (p.photo_ids?.length) box.append(el('img', { className: 'map-popup-img', src: photoUrl(p.photo_ids[0], true), alt: '' }));
+  box.append(
+    el('strong', { textContent: p.name }),
+    el('span', { className: 'map-popup-location', textContent: p.location }),
+    el('span', {
+      className: 'map-popup-meta',
+      textContent: [formatPrice(p.price), amountInWords(p.price) && `(${amountInWords(p.price)})`,
+        '·', score === null ? 'no score' : `${score}/10`].filter(Boolean).join(' '),
+    }),
+  );
+
+  const actions = el('div', { className: 'map-popup-actions' });
+  const action = (label, onClick) => {
+    const button = el('button', { type: 'button', className: 'link-btn', textContent: label });
+    button.addEventListener('click', onClick);
+    actions.append(button);
+  };
+  if (p.photo_ids?.length) action('Photos', () => openViewer(p));
+  action('Edit', () => openPropertyDialog(p));
+  action('Show card', () => {
+    const card = document.querySelector(`.card[data-id="${p.id}"]`);
+    card?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card?.classList.add('flash');
+    setTimeout(() => card?.classList.remove('flash'), 1600);
+  });
+  actions.append(el('a', { className: 'link-btn', href: directionsUrl(p), target: '_blank', rel: 'noopener noreferrer', textContent: 'Directions' }));
+  box.append(actions);
+  return box;
+}
+
+function renderMap(items) {
+  if (!window.L) return; // map library failed to load; the rest of the app still works
+  maps.dashboard ??= createMap('map');
+  maps.markers ??= L.layerGroup().addTo(maps.dashboard);
+  maps.markers.clearLayers();
+
+  const located = items.filter(({ p }) => hasCoords(p));
+  for (const entry of located) {
+    L.marker([entry.p.latitude, entry.p.longitude], { icon: pinIcon(entry.score), title: entry.p.name, riseOnHover: true })
+      .bindPopup(() => popupContent(entry), { minWidth: 200, maxWidth: 240 })
+      .addTo(maps.markers);
+  }
+
+  // Re-fit the view only when the set of pins changes, not on every keystroke.
+  const key = located.map(({ p }) => `${p.id}:${p.latitude},${p.longitude}`).join('|');
+  maps.dashboard.invalidateSize();
+  if (key !== maps.fittedKey) {
+    maps.fittedKey = key;
+    if (located.length === 1) maps.dashboard.setView([located[0].p.latitude, located[0].p.longitude], 14);
+    else if (located.length > 1) {
+      maps.dashboard.fitBounds(located.map(({ p }) => [p.latitude, p.longitude]), { padding: [40, 40], maxZoom: 15 });
+    } else maps.dashboard.setView([20, 0], 2);
+  }
+
+  const missing = items.length - located.length;
+  const note = $('#map-note');
+  if (!items.length) note.textContent = '';
+  else if (!located.length) note.textContent = 'No pins yet. Edit a property and add its map location to see it here.';
+  else note.textContent = missing
+    ? `${located.length} of ${items.length} on the map. ${missing} ${missing === 1 ? 'has' : 'have'} no location yet.`
+    : `All ${located.length} on the map.`;
+}
+
+/** Google Maps links and "lat, lng" text → { lat, lng }; null if empty; undefined if unreadable. */
+function parseCoordinates(text) {
+  const s = text.trim();
+  if (!s) return null;
+  const num = '(-?\\d{1,3}(?:\\.\\d+)?)';
+  const match = s.match(new RegExp(`!3d${num}!4d${num}`)) // exact pin in a Google Maps place link
+    || s.match(new RegExp(`[?&](?:q|query|ll|destination)=${num},\\s*${num}`))
+    || s.match(new RegExp(`@${num},\\s*${num}`)) // map centre in a Google Maps link
+    || s.match(new RegExp(`^\\(?\\s*${num}\\s*[,;\\s]\\s*${num}\\s*\\)?$`));
+  if (!match) return undefined;
+  const lat = Number(match[1]);
+  const lng = Number(match[2]);
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return undefined;
+  return { lat, lng };
+}
+
+const coordsStatus = (message, isError = false) => {
+  const status = $('#coords-status');
+  status.textContent = message;
+  status.classList.toggle('form-error', isError);
+};
+
+function setFormCoords(coords, { pan = false } = {}) {
+  state.formCoords = coords && { lat: Number(coords.lat.toFixed(6)), lng: Number(coords.lng.toFixed(6)) };
+  $('#coords-input').value = state.formCoords ? `${state.formCoords.lat}, ${state.formCoords.lng}` : '';
+  $('#coords-clear').hidden = !state.formCoords;
+  if (!maps.picker) return;
+
+  if (!state.formCoords) {
+    maps.pin?.remove();
+    maps.pin = null;
+    return;
+  }
+  const latLng = [state.formCoords.lat, state.formCoords.lng];
+  if (!maps.pin) {
+    maps.pin = L.marker(latLng, { icon: pinIcon(null, 'pin-edit'), draggable: true, autoPan: true }).addTo(maps.picker);
+    maps.pin.on('dragend', () => {
+      const { lat, lng } = maps.pin.getLatLng();
+      setFormCoords({ lat, lng });
+      coordsStatus('Pin moved.');
+    });
+  } else {
+    maps.pin.setLatLng(latLng);
+  }
+  if (pan) maps.picker.setView(latLng, Math.max(maps.picker.getZoom() || 0, 16));
+}
+
+function openPicker() {
+  if (!window.L) return;
+  if (!maps.picker) {
+    maps.picker = createMap('picker-map');
+    maps.picker.on('click', (e) => {
+      setFormCoords(e.latlng);
+      coordsStatus('Pin placed. Drag it to adjust.');
+    });
+  }
+  maps.picker.invalidateSize();
+  setFormCoords(state.formCoords);
+
+  // Start on this property, else on the other properties, else the whole world.
+  const others = state.properties.filter(hasCoords).map((p) => [p.latitude, p.longitude]);
+  if (state.formCoords) maps.picker.setView([state.formCoords.lat, state.formCoords.lng], 16);
+  else if (others.length) maps.picker.fitBounds(others, { padding: [30, 30], maxZoom: 14 });
+  else maps.picker.setView([20, 0], 2);
+}
+
+async function findFromLocation() {
+  const text = $('#property-form').elements.location.value.trim();
+  if (!text) return coordsStatus('Type the location above first.', true);
+  coordsStatus('Searching…');
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(text)}`;
+    const res = await fetch(url, { headers: { 'Accept-Language': navigator.language || 'en' } });
+    if (!res.ok) throw new Error();
+    const [hit] = await res.json();
+    if (!hit) return coordsStatus("Couldn't find that location. Try adding the city, or click the map.", true);
+    setFormCoords({ lat: Number(hit.lat), lng: Number(hit.lon) }, { pan: true });
+    coordsStatus(`Found “${hit.display_name}”. Check the pin and drag it onto the exact house.`);
+  } catch {
+    coordsStatus('Location search is unavailable right now. Click the map to drop a pin instead.', true);
+  }
+}
+
+function useCurrentLocation() {
+  coordsStatus('Getting your location…');
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      setFormCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude }, { pan: true });
+      coordsStatus(`Using your current location (accurate to about ${Math.round(pos.coords.accuracy)} m).`);
+    },
+    (err) => coordsStatus(err.code === err.PERMISSION_DENIED
+      ? 'Location access was blocked. Allow it in your browser settings, or click the map.'
+      : "Couldn't get your location. Click the map to drop a pin instead.", true),
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 },
+  );
 }
 
 // ---------- Match scoring ----------
@@ -204,10 +464,18 @@ function render() {
 
   const items = scored
     .filter(({ p }) => !type || p.type === type)
-    .filter(({ p }) => !query || [p.name, p.location, p.agent_number].some((v) => v.toLowerCase().includes(query)))
+    .filter(({ p }) => !query
+      || [p.name, p.location, p.agent_number, p.description || ''].some((v) => v.toLowerCase().includes(query)))
     .sort(sorters[sort]);
 
   $('#list').replaceChildren(...items.map(renderCard));
+  renderMap(items);
+  // Offer "Show more" only on descriptions that are actually cut off.
+  requestAnimationFrame(() => {
+    for (const desc of document.querySelectorAll('.card-desc')) {
+      desc.nextElementSibling.hidden = desc.scrollHeight <= desc.clientHeight + 1;
+    }
+  });
 
   const hasAny = state.properties.length > 0;
   $('#empty').hidden = items.length > 0;
@@ -227,10 +495,35 @@ function renderCard({ p, result, score }) {
   const level = scoreLevel(score);
 
   card.dataset.id = p.id;
+
+  const photoIds = p.photo_ids || [];
+  const photoButton = card.querySelector('[data-action="photos"]');
+  if (photoIds.length) {
+    const cover = field('cover');
+    cover.src = photoUrl(photoIds[0], true);
+    cover.alt = `${p.name}, cover photo`;
+    cover.hidden = false;
+    field('no-photo').hidden = true;
+    photoButton.setAttribute('aria-label', `View ${photoIds.length} photo${photoIds.length === 1 ? '' : 's'} of ${p.name}`);
+    if (photoIds.length > 1) {
+      field('photo-count').textContent = `${photoIds.length} photos`;
+      field('photo-count').hidden = false;
+    }
+  } else {
+    photoButton.classList.add('card-photo-none');
+    photoButton.setAttribute('aria-label', `Add photos of ${p.name}`);
+  }
+
+  if (p.description) {
+    field('description').textContent = p.description;
+    field('desc-wrap').hidden = false;
+  }
+
   field('type').textContent = p.type;
   field('name').textContent = p.name;
   field('location').textContent = p.location;
   field('price').textContent = formatPrice(p.price);
+  field('price-words').textContent = amountInWords(p.price);
 
   const badge = field('score');
   badge.textContent = score === null ? '–/10' : `${score}/10`;
@@ -257,6 +550,14 @@ function renderCard({ p, result, score }) {
     agent.removeAttribute('href');
     agent.classList.add('agent-empty');
     agent.querySelector('span').textContent = 'No agent number';
+  }
+
+  if (hasCoords(p)) {
+    const directions = field('directions');
+    directions.href = directionsUrl(p);
+    directions.title = 'Directions in Google Maps';
+    directions.setAttribute('aria-label', `Directions to ${p.name}`);
+    directions.hidden = false;
   }
 
   card.querySelector('[data-action="edit"]').setAttribute('aria-label', `Edit ${p.name}`);
@@ -293,9 +594,9 @@ function renderWhy(details, property, result) {
 function renderStats(scored) {
   const list = state.properties;
   $('#stat-count').textContent = list.length;
-  $('#stat-avg').textContent = list.length
-    ? formatPrice(list.reduce((sum, p) => sum + p.price, 0) / list.length)
-    : '—';
+  const average = list.length ? list.reduce((sum, p) => sum + p.price, 0) / list.length : null;
+  $('#stat-avg').textContent = average === null ? '—' : formatPrice(average);
+  $('#stat-avg-words').textContent = average === null ? '' : amountInWords(average);
 
   const best = scored
     .filter((s) => s.score !== null)
@@ -320,14 +621,28 @@ function openPropertyDialog(property) {
     form.elements.type.value = property.type;
     form.elements.price.value = property.price;
     form.elements.agent_number.value = property.agent_number;
+    form.elements.description.value = property.description || '';
   }
   renderFeatureChecks(property?.features ?? []);
+
+  state.photoOriginal = [...(property?.photo_ids ?? [])];
+  state.photoDraft = state.photoOriginal.map((id) => ({ id, url: photoUrl(id, true) }));
+  state.removedPhotoIds = [];
+  $('#photo-status').textContent = '';
+  renderPhotoList();
 
   const override = property?.score_override ?? null;
   $('#override-toggle').checked = override !== null;
   $('#score-input').value = override ?? 5;
   updateScoreUI();
+
+  state.formCoords = property && hasCoords(property) ? { lat: property.latitude, lng: property.longitude } : null;
+  $('#coords-input').value = '';
+  coordsStatus('Click the map to drop a pin, then drag it to adjust.');
+  updateAmountHint(form.elements.price);
   $('#property-dialog').showModal();
+  openPicker(); // after showModal, so the map can measure its size
+  if (!window.L) setFormCoords(state.formCoords);
 }
 
 function renderFeatureChecks(selected) {
@@ -353,7 +668,124 @@ function readPropertyForm() {
     agent_number: data.get('agent_number'),
     features: data.getAll('features'),
     score_override: $('#override-toggle').checked ? Number($('#score-input').value) : null,
+    description: data.get('description'),
+    latitude: state.formCoords?.lat ?? null,
+    longitude: state.formCoords?.lng ?? null,
   };
+}
+
+function renderPhotoList() {
+  const draft = state.photoDraft;
+  $('#photo-list').replaceChildren(...draft.map((item, i) => {
+    const tile = el('div', { className: 'photo-tile' }, el('img', { src: item.url, alt: `Photo ${i + 1}` }));
+
+    if (i === 0) {
+      tile.append(el('span', { className: 'cover-badge', textContent: 'Cover' }));
+    } else {
+      const makeCover = el('button', { type: 'button', className: 'tile-btn tile-cover', title: 'Make cover' }, svg(PIN_SVG));
+      makeCover.setAttribute('aria-label', `Make photo ${i + 1} the cover`);
+      makeCover.addEventListener('click', () => { draft.unshift(...draft.splice(i, 1)); renderPhotoList(); });
+      tile.append(makeCover);
+    }
+
+    const remove = el('button', { type: 'button', className: 'tile-btn tile-remove', textContent: '×', title: 'Remove' });
+    remove.setAttribute('aria-label', `Remove photo ${i + 1}`);
+    remove.addEventListener('click', () => {
+      const [removed] = draft.splice(i, 1);
+      if (removed.id) state.removedPhotoIds.push(removed.id); // already on the server
+      if (removed.full) URL.revokeObjectURL(removed.url); // a local preview
+      renderPhotoList();
+    });
+    tile.append(remove);
+    return tile;
+  }));
+  $('#photo-add').hidden = draft.length >= MAX_PHOTOS;
+}
+
+async function addPhotos(files) {
+  const draft = state.photoDraft;
+  const room = MAX_PHOTOS - draft.length;
+  const accepted = files.slice(0, room);
+  const failed = [];
+  const status = $('#photo-status');
+
+  state.photosProcessing += 1;
+  status.textContent = `Preparing ${accepted.length} photo${accepted.length === 1 ? '' : 's'}…`;
+  for (const file of accepted) {
+    try {
+      const { full, thumb } = await resizePhoto(file);
+      if (state.photoDraft !== draft) return; // dialog was closed or reopened meanwhile
+      draft.push({ full, thumb, url: URL.createObjectURL(thumb) });
+      renderPhotoList();
+    } catch {
+      failed.push(file.name);
+    }
+  }
+  state.photosProcessing -= 1;
+
+  const notes = [];
+  if (files.length > room) notes.push(`Only ${MAX_PHOTOS} photos per property, so ${files.length - room} weren't added.`);
+  if (failed.length) notes.push(`Couldn't read ${failed.join(', ')}. Try JPEG or PNG.`);
+  status.textContent = notes.join(' ');
+}
+
+const photosChanged = () =>
+  state.removedPhotoIds.length > 0
+  || state.photoDraft.some((item) => item.full && !item.id)
+  || state.photoDraft.map((item) => item.id).join() !== state.photoOriginal.join();
+
+/** Apply the dialog's photo edits to a saved property. Returns the final photo ids, cover first. */
+async function syncPhotos(propertyId) {
+  while (state.removedPhotoIds.length) {
+    await api(`photos/${state.removedPhotoIds[0]}`, { method: 'DELETE' }).catch((err) => {
+      if (!/not found/i.test(err.message)) throw err;
+    });
+    state.removedPhotoIds.shift();
+  }
+
+  const pending = state.photoDraft.filter((item) => !item.id);
+  for (const [n, item] of pending.entries()) {
+    $('#photo-status').textContent = `Uploading photo ${n + 1} of ${pending.length}…`;
+    const body = { data: await blobToBase64(item.full), thumb: await blobToBase64(item.thumb) };
+    item.id = (await api(`properties/${propertyId}/photos`, { method: 'POST', body })).id;
+  }
+
+  const order = state.photoDraft.map((item) => item.id);
+  await api(`properties/${propertyId}/photos`, { method: 'PUT', body: { order } });
+  state.photoOriginal = order;
+  $('#photo-status').textContent = '';
+  return order;
+}
+
+function upsertProperty(property) {
+  const exists = state.properties.some((p) => p.id === property.id);
+  state.properties = exists
+    ? state.properties.map((p) => (p.id === property.id ? property : p))
+    : [property, ...state.properties];
+}
+
+// ---------- Photo viewer ----------
+
+function openViewer(property, index = 0) {
+  state.viewer = { ids: property.photo_ids, index, name: property.name };
+  showViewerPhoto();
+  $('#viewer-dialog').showModal();
+}
+
+function showViewerPhoto() {
+  const { ids, index, name } = state.viewer;
+  const img = $('#viewer-img');
+  img.src = photoUrl(ids[index]);
+  img.alt = `${name}, photo ${index + 1} of ${ids.length}`;
+  $('#viewer-caption').textContent = ids.length > 1 ? `${name} · ${index + 1} / ${ids.length}` : name;
+  $('#viewer-prev').hidden = ids.length < 2;
+  $('#viewer-next').hidden = ids.length < 2;
+}
+
+function stepViewer(delta) {
+  const viewer = state.viewer;
+  viewer.index = (viewer.index + delta + viewer.ids.length) % viewer.ids.length;
+  showViewerPhoto();
 }
 
 function updateScoreUI() {
@@ -392,6 +824,8 @@ function openPrefsDialog() {
   form.elements['budget-importance'].value = prefs.budget.importance;
   form.elements['budget-min'].value = prefs.budget.min ?? '';
   form.elements['budget-max'].value = prefs.budget.max ?? '';
+  updateAmountHint(form.elements['budget-min']);
+  updateAmountHint(form.elements['budget-max']);
 
   $('#pref-types').replaceChildren(...state.types.map((type) => el('label', { className: 'check-chip' },
     el('input', { type: 'checkbox', value: type, checked: prefs.types.items.includes(type) }),
@@ -542,8 +976,78 @@ function wireEvents() {
     const id = Number(button.closest('.card').dataset.id);
     const property = state.properties.find((p) => p.id === id);
     if (!property) return;
-    if (button.dataset.action === 'edit') openPropertyDialog(property);
-    if (button.dataset.action === 'delete') openConfirmDialog(property);
+    const action = button.dataset.action;
+    if (action === 'edit') openPropertyDialog(property);
+    if (action === 'delete') openConfirmDialog(property);
+    if (action === 'photos') {
+      if (property.photo_ids?.length) openViewer(property);
+      else openPropertyDialog(property);
+    }
+    if (action === 'toggle-desc') {
+      const expanded = button.previousElementSibling.classList.toggle('expanded');
+      button.textContent = expanded ? 'Show less' : 'Show more';
+    }
+  });
+
+  // Photo viewer
+  $('#viewer-prev').addEventListener('click', () => stepViewer(-1));
+  $('#viewer-next').addEventListener('click', () => stepViewer(1));
+  $('#viewer-dialog').addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') stepViewer(-1);
+    if (e.key === 'ArrowRight') stepViewer(1);
+  });
+  $('#viewer-dialog .viewer-stage').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) $('#viewer-dialog').close();
+  });
+  // Swipe left/right on touch screens.
+  let touchStartX = null;
+  $('#viewer-dialog').addEventListener('touchstart', (e) => { touchStartX = e.touches[0].clientX; }, { passive: true });
+  $('#viewer-dialog').addEventListener('touchend', (e) => {
+    if (touchStartX === null || state.viewer.ids.length < 2) return;
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    touchStartX = null;
+    if (Math.abs(dx) > 50) stepViewer(dx < 0 ? 1 : -1);
+  });
+
+  // Amounts: show Indian grouping and lakh/crore while typing.
+  document.querySelectorAll('[data-amount-hint]').forEach((input) =>
+    input.addEventListener('input', () => updateAmountHint(input)));
+
+  // Property map location
+  const coordsInput = $('#coords-input');
+  const applyTypedCoords = () => {
+    const parsed = parseCoordinates(coordsInput.value);
+    if (parsed === undefined) {
+      coordsStatus(/goo\.gl|maps\.app/.test(coordsInput.value)
+        ? "Short links can't be read. Open the link, then copy the full address-bar URL or the coordinates."
+        : 'Couldn\'t read that. Use "25.2048, 55.2708" or a full Google Maps link.', true);
+      return;
+    }
+    setFormCoords(parsed, { pan: true });
+    coordsStatus(parsed ? 'Pin placed. Drag it to adjust.' : 'Pin removed.');
+  };
+  coordsInput.addEventListener('change', applyTypedCoords);
+  coordsInput.addEventListener('paste', () => setTimeout(applyTypedCoords));
+  coordsInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); applyTypedCoords(); }
+  });
+  $('#coords-find').addEventListener('click', findFromLocation);
+  $('#coords-here').hidden = !('geolocation' in navigator);
+  $('#coords-here').addEventListener('click', useCurrentLocation);
+  $('#coords-clear').addEventListener('click', () => {
+    setFormCoords(null);
+    coordsStatus('Pin removed.');
+  });
+
+  // Property photos
+  $('#photo-add').addEventListener('click', () => $('#photo-input').click());
+  $('#photo-input').addEventListener('change', (e) => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    if (files.length) addPhotos(files);
+  });
+  $('#property-dialog').addEventListener('close', () => {
+    for (const item of state.photoDraft) if (item.full) URL.revokeObjectURL(item.url);
   });
 
   document.querySelectorAll('[data-close]').forEach((btn) =>
@@ -562,22 +1066,35 @@ function wireEvents() {
     const form = e.currentTarget;
     const body = readPropertyForm();
     $('#property-error').textContent = '';
+    if (state.photosProcessing) {
+      $('#property-error').textContent = 'Wait a moment for your photos to finish preparing.';
+      return;
+    }
+    const isNew = !state.editingId;
+    const submit = $('#property-submit');
+    const submitLabel = submit.textContent;
     setBusy(form, true);
     try {
-      if (state.editingId) {
-        const updated = await api(`properties/${state.editingId}`, { method: 'PUT', body });
-        state.properties = state.properties.map((p) => (p.id === updated.id ? updated : p));
-        toast('Changes saved');
-      } else {
-        const created = await api('properties', { method: 'POST', body });
-        state.properties.unshift(created);
-        toast('Property added');
+      const saved = isNew
+        ? await api('properties', { method: 'POST', body })
+        : await api(`properties/${state.editingId}`, { method: 'PUT', body });
+      upsertProperty(saved);
+      // From here on this dialog edits the saved property, so a retry after a failed upload can't create a duplicate.
+      state.editingId = saved.id;
+
+      if (photosChanged()) {
+        submit.textContent = 'Uploading photos…';
+        upsertProperty({ ...saved, photo_ids: await syncPhotos(saved.id) });
       }
+
       $('#property-dialog').close();
       render();
+      toast(isNew ? 'Property added' : 'Changes saved');
     } catch (err) {
       $('#property-error').textContent = err.message;
+      render();
     } finally {
+      submit.textContent = submitLabel;
       setBusy(form, false);
     }
   });

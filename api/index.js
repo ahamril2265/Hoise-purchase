@@ -115,13 +115,13 @@ function json(status, data, headers = {}) {
   });
 }
 
-async function readJson(request) {
+async function readJson(request, maxChars = MAX_BODY_CHARS) {
   // Requiring JSON also blocks cross-site form posts (CSRF), alongside the SameSite cookie.
   if (!(request.headers.get('content-type') || '').startsWith('application/json')) {
     throw new HttpError(415, 'Expected a JSON request.');
   }
   const text = await request.text();
-  if (text.length > MAX_BODY_CHARS) throw new HttpError(413, 'Request is too large.');
+  if (text.length > maxChars) throw new HttpError(413, 'Request is too large.');
   try {
     return JSON.parse(text || '{}');
   } catch {
@@ -162,6 +162,9 @@ function parseProperty(body) {
     agent_number: str(body.agent_number, 40),
     features: stringList(body.features, 30, 60),
     score_override: isBlank(body.score_override) ? null : Number(body.score_override),
+    description: str(body.description, 2000),
+    latitude: isBlank(body.latitude) ? null : Number(body.latitude),
+    longitude: isBlank(body.longitude) ? null : Number(body.longitude),
   };
 
   const errors = [];
@@ -176,12 +179,47 @@ function parseProperty(body) {
   if (property.agent_number && !/^[0-9+()\-.\s]{3,40}$/.test(property.agent_number)) {
     errors.push('Agent number can only contain digits, spaces and + ( ) - .');
   }
+  const { latitude: lat, longitude: lng } = property;
+  if ((lat === null) !== (lng === null)) {
+    errors.push('Coordinates need both a latitude and a longitude.');
+  } else if (lat !== null && !(Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180)) {
+    errors.push('Coordinates are out of range.');
+  }
   if (errors.length) throw new HttpError(400, errors.join(' '));
   return property;
 }
 
-const propertyParams = (p) =>
-  [p.name, p.location, p.type, p.price, p.agent_number, JSON.stringify(p.features), p.score_override];
+const propertyParams = (p) => [
+  p.name, p.location, p.type, p.price, p.agent_number, JSON.stringify(p.features), p.score_override, p.description,
+  p.latitude, p.longitude,
+];
+
+// Every property comes back with the ids of its photos, cover first.
+const PROPERTY_SELECT = `
+  SELECT p.*,
+         COALESCE((SELECT json_agg(ph.id ORDER BY ph.position, ph.id) FROM photos ph WHERE ph.property_id = p.id),
+                  '[]'::json) AS photo_ids
+  FROM properties p`;
+
+const getProperty = async (id) => (await query(`${PROPERTY_SELECT} WHERE p.id = $1`, [id]))[0];
+
+// ---------- Photos ----------
+// The browser resizes photos to JPEG before upload (a full-size image and a thumbnail), sent as base64.
+
+const MAX_PHOTOS_PER_PROPERTY = 12;
+const MAX_PHOTO_BYTES = 3 * 1024 * 1024;
+const MAX_THUMB_BYTES = 400 * 1024;
+const MAX_UPLOAD_CHARS = 4_200_000; // stays under Vercel's 4.5 MB request limit
+
+function jpegBase64(value, maxBytes) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    throw new HttpError(400, 'Photo data is not valid.');
+  }
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length > maxBytes) throw new HttpError(413, 'Photo is too large.');
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) throw new HttpError(400, 'Photos must be JPEG images.');
+  return bytes.toString('base64');
+}
 
 // ---------- Preferences (drive the automatic match score, calculated in the browser) ----------
 
@@ -288,17 +326,18 @@ async function route(request, method, path) {
   }
 
   if (key === 'GET properties') {
-    return json(200, await query(`SELECT * FROM properties ORDER BY id DESC`));
+    return json(200, await query(`${PROPERTY_SELECT} ORDER BY p.id DESC`));
   }
 
   if (key === 'POST properties') {
     const p = parseProperty(await readJson(request));
-    const [created] = await query(
-      `INSERT INTO properties (name, location, type, price, agent_number, features, score_override)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7) RETURNING *`,
+    const [{ id }] = await query(
+      `INSERT INTO properties
+         (name, location, type, price, agent_number, features, score_override, description, latitude, longitude)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10) RETURNING id`,
       propertyParams(p),
     );
-    return json(201, created);
+    return json(201, await getProperty(id));
   }
 
   if (key === 'GET preferences') {
@@ -321,20 +360,81 @@ async function route(request, method, path) {
 
     if (method === 'PUT') {
       const p = parseProperty(await readJson(request));
-      const [updated] = await query(
+      const rows = await query(
         `UPDATE properties
          SET name = $1, location = $2, type = $3, price = $4, agent_number = $5,
-             features = $6::jsonb, score_override = $7, updated_at = now()
-         WHERE id = $8 RETURNING *`,
+             features = $6::jsonb, score_override = $7, description = $8,
+             latitude = $9, longitude = $10, updated_at = now()
+         WHERE id = $11 RETURNING id`,
         [...propertyParams(p), id],
       );
-      if (!updated) throw new HttpError(404, 'Property not found.');
-      return json(200, updated);
+      if (!rows.length) throw new HttpError(404, 'Property not found.');
+      return json(200, await getProperty(id));
     }
 
     if (method === 'DELETE') {
       const rows = await query(`DELETE FROM properties WHERE id = $1 RETURNING id`, [id]);
       if (!rows.length) throw new HttpError(404, 'Property not found.');
+      return json(200, { ok: true });
+    }
+  }
+
+  const photosMatch = path.match(/^properties\/(\d+)\/photos$/);
+  if (photosMatch) {
+    const propertyId = Number(photosMatch[1]);
+    const [owner] = await query(`SELECT id FROM properties WHERE id = $1`, [propertyId]);
+    if (!owner) throw new HttpError(404, 'Property not found.');
+
+    // Upload one photo: { data, thumb } as base64 JPEG.
+    if (method === 'POST') {
+      const body = await readJson(request, MAX_UPLOAD_CHARS);
+      const data = jpegBase64(body.data, MAX_PHOTO_BYTES);
+      const thumb = jpegBase64(body.thumb, MAX_THUMB_BYTES);
+      const [{ count }] = await query(`SELECT count(*)::int AS count FROM photos WHERE property_id = $1`, [propertyId]);
+      if (count >= MAX_PHOTOS_PER_PROPERTY) {
+        throw new HttpError(400, `A property can have up to ${MAX_PHOTOS_PER_PROPERTY} photos.`);
+      }
+      const [photo] = await query(
+        `INSERT INTO photos (property_id, data, thumb, position)
+         VALUES ($1, decode($2, 'base64'), decode($3, 'base64'),
+                 COALESCE((SELECT max(position) + 1 FROM photos WHERE property_id = $1), 0))
+         RETURNING id`,
+        [propertyId, data, thumb],
+      );
+      return json(201, photo);
+    }
+
+    // Reorder: { order: [photoId, …] }, cover first.
+    if (method === 'PUT') {
+      const { order } = await readJson(request);
+      if (!Array.isArray(order) || !order.every(Number.isInteger)) throw new HttpError(400, 'Invalid photo order.');
+      for (const [position, photoId] of order.entries()) {
+        await query(`UPDATE photos SET position = $1 WHERE id = $2 AND property_id = $3`, [position, photoId, propertyId]);
+      }
+      return json(200, { ok: true });
+    }
+  }
+
+  const photoMatch = path.match(/^photos\/(\d+)(\/thumb)?$/);
+  if (photoMatch) {
+    const photoId = Number(photoMatch[1]);
+
+    if (method === 'GET') {
+      const column = photoMatch[2] ? 'thumb' : 'data';
+      const [photo] = await query(`SELECT encode(${column}, 'base64') AS image FROM photos WHERE id = $1`, [photoId]);
+      if (!photo) throw new HttpError(404, 'Photo not found.');
+      return new Response(Buffer.from(photo.image, 'base64'), {
+        headers: {
+          'Content-Type': 'image/jpeg',
+          // Photo ids never change content, so the browser can keep them; "private" keeps them off shared caches.
+          'Cache-Control': 'private, max-age=31536000, immutable',
+        },
+      });
+    }
+
+    if (method === 'DELETE') {
+      const rows = await query(`DELETE FROM photos WHERE id = $1 RETURNING id`, [photoId]);
+      if (!rows.length) throw new HttpError(404, 'Photo not found.');
       return json(200, { ok: true });
     }
   }

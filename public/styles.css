@@ -189,6 +189,10 @@ input[type="range"] { height: 42px; padding: 0; border: 0; background: none; box
 .card-location { display: flex; align-items: flex-start; gap: 6px; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
 .card-location svg { width: 16px; height: 16px; margin-top: 2px; }
 .card-price { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.price-words { font-size: 14px; font-weight: 500; color: var(--muted); }
+.stat-sub { color: var(--muted); font-size: 13px; }
+.stat-sub:empty { display: none; }
+.amount-hint { min-height: 1.2em; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 .meter { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
 .meter span { display: block; height: 100%; border-radius: inherit; }
@@ -350,6 +354,152 @@ select.importance { width: auto; height: 34px; padding: 0 10px; font-size: 13px;
 }
 .suggestion:hover { border-color: var(--accent); color: var(--accent); }
 
+/* ---------- Photos & description ---------- */
+
+textarea {
+  width: 100%; min-height: 96px; padding: 10px 12px; resize: vertical;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px;
+  font: inherit; line-height: 1.5;
+}
+textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+textarea::placeholder { color: var(--muted); opacity: 0.8; }
+
+.card-photo {
+  position: relative; display: block; margin: -18px -18px 6px; padding: 0;
+  aspect-ratio: 16 / 10; overflow: hidden; cursor: pointer;
+  border: 0; border-radius: var(--radius) var(--radius) 0 0; background: var(--surface-2);
+}
+.card-photo img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.3s; }
+.card-photo:hover img { transform: scale(1.03); }
+.card-photo-empty {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  color: var(--muted); font: inherit; font-size: 13px; font-weight: 500;
+}
+.card-photo-empty svg { width: 28px; height: 28px; stroke-width: 1.4; }
+.card-photo-none { aspect-ratio: 16 / 5; }
+.card-photo-none:hover .card-photo-empty { color: var(--accent); }
+.photo-count {
+  position: absolute; right: 10px; bottom: 10px; padding: 3px 9px; border-radius: 999px;
+  background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 12px; font-weight: 600;
+}
+
+.card-desc {
+  color: var(--text); font-size: 14px; white-space: pre-line; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
+}
+.card-desc.expanded { display: block; -webkit-line-clamp: unset; line-clamp: none; }
+.link-btn {
+  padding: 0; border: 0; background: none; color: var(--accent);
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.link-btn:hover { text-decoration: underline; }
+
+.photo-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.photo-list:empty { display: none; }
+.photo-tile { position: relative; aspect-ratio: 1; border-radius: 10px; overflow: hidden; background: var(--surface-2); }
+.photo-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cover-badge {
+  position: absolute; left: 6px; bottom: 6px; padding: 1px 7px; border-radius: 999px;
+  background: var(--accent); color: var(--on-accent); font-size: 11px; font-weight: 700;
+}
+.tile-btn {
+  position: absolute; top: 5px; display: grid; place-items: center; width: 26px; height: 26px;
+  border: 0; border-radius: 999px; background: rgba(0, 0, 0, 0.6); color: #fff;
+  font-size: 17px; line-height: 1; cursor: pointer;
+}
+.tile-btn:hover { background: rgba(0, 0, 0, 0.8); }
+.tile-btn svg { width: 14px; height: 14px; }
+.tile-remove { right: 5px; }
+.tile-cover { left: 5px; }
+.photo-add { width: fit-content; }
+
+/* Full-screen viewer */
+.viewer {
+  width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh; margin: 0;
+  border: 0; border-radius: 0; background: rgba(8, 10, 9, 0.96); color: #fff;
+  display: none; flex-direction: column; overflow: hidden;
+}
+.viewer[open] { display: flex; }
+.viewer::backdrop { background: rgba(0, 0, 0, 0.6); }
+.viewer-top {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; font-weight: 600;
+}
+.viewer-stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 0 16px 16px; }
+.viewer-stage img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; }
+.viewer-btn {
+  display: grid; place-items: center; width: 42px; height: 42px; flex-shrink: 0;
+  border: 0; border-radius: 999px; background: rgba(255, 255, 255, 0.12); color: #fff; cursor: pointer;
+}
+.viewer-btn:hover { background: rgba(255, 255, 255, 0.24); }
+.viewer-btn svg { width: 20px; height: 20px; stroke-width: 2; }
+.viewer-nav { position: absolute; top: 50%; transform: translateY(-50%); }
+#viewer-prev { left: 20px; }
+#viewer-next { right: 20px; }
+
+/* ---------- Maps ---------- */
+
+.map-card { margin-bottom: 20px; }
+.map {
+  height: 380px; border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; background: var(--surface-2); z-index: 0;
+}
+.map-note { margin-top: 8px; color: var(--muted); font-size: 13px; }
+.map-note:empty { display: none; }
+
+.picker-map {
+  height: 220px; border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; background: var(--surface-2); z-index: 0; cursor: crosshair;
+}
+.coord-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* Score-coloured map pins */
+.pin { background: none; border: 0; }
+.pin span {
+  display: grid; place-items: center; width: 34px; height: 34px;
+  border-radius: 50% 50% 50% 0; transform: rotate(-45deg);
+  border: 2px solid #fff; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  color: #fff; font: 700 13px/1 var(--font);
+}
+.pin b { transform: rotate(45deg); } /* keep the number upright inside the rotated pin */
+.pin-high span { background: var(--high); }
+.pin-mid span { background: var(--mid); }
+.pin-low span { background: var(--low); }
+.pin-none span { background: #7a8580; }
+.pin-edit span { background: var(--accent); }
+
+.leaflet-container { font-family: var(--font); background: var(--surface-2); }
+/* Dark map tiles: invert the standard OpenStreetMap style and turn the hues back. */
+@media (prefers-color-scheme: dark) {
+  .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.9) saturate(0.6); }
+}
+.leaflet-popup-content-wrapper, .leaflet-popup-tip {
+  background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg);
+}
+.leaflet-popup-content-wrapper { border-radius: 12px; }
+.leaflet-popup-content { margin: 12px; }
+.leaflet-container a.leaflet-popup-close-button { color: var(--muted); }
+.leaflet-bar a, .leaflet-bar a:hover {
+  background: var(--surface); color: var(--text); border-bottom-color: var(--border);
+}
+.leaflet-control-attribution { background: color-mix(in srgb, var(--surface) 85%, transparent) !important; color: var(--muted); }
+.leaflet-control-attribution a { color: var(--muted); }
+
+.map-popup { display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.map-popup strong { font-size: 15px; }
+.map-popup-img { width: 100%; aspect-ratio: 16 / 10; object-fit: cover; border-radius: 8px; margin-bottom: 4px; }
+.map-popup-location { color: var(--muted); }
+.map-popup-meta { font-weight: 600; }
+.map-popup-actions { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.map-popup-actions a.link-btn { color: var(--accent); text-decoration: none; }
+
+.card.flash { animation: flash 1.6s ease-out; }
+@keyframes flash {
+  0%, 30% { box-shadow: 0 0 0 3px var(--accent), var(--shadow); }
+  100% { box-shadow: var(--shadow); }
+}
+
 /* ---------- Toast ---------- */
 
 .toast {
@@ -381,6 +531,7 @@ select.importance { width: auto; height: 34px; padding: 0 10px; font-size: 13px;
   .topbar-actions { gap: 6px; }
   .topbar-actions .btn-sm { padding: 0 10px; }
   .banner { flex-direction: column; align-items: stretch; }
+  .map { height: 280px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
