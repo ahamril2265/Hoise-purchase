@@ -46,7 +46,11 @@
         <span>Property Tracker</span>
       </div>
       <nav class="topbar-actions">
-        <button id="change-password-btn" class="btn btn-ghost btn-sm" type="button">Change password</button>
+        <button id="prefs-btn" class="btn btn-ghost btn-sm" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h7M15 6h1M4 14h1M9 14h7"/><circle cx="13" cy="6" r="2"/><circle cx="7" cy="14" r="2"/></svg>
+          Preferences
+        </button>
+        <button id="change-password-btn" class="btn btn-ghost btn-sm" type="button"><span class="hide-sm">Change password</span><span class="show-sm">Password</span></button>
         <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Sign out</button>
       </nav>
     </header>
@@ -62,6 +66,14 @@
           Add property
         </button>
       </section>
+
+      <div id="prefs-banner" class="banner" hidden>
+        <div>
+          <strong>Get automatic match scores</strong>
+          <p class="muted">Tell us what you're looking for and every property is scored for you.</p>
+        </div>
+        <button id="banner-prefs-btn" class="btn btn-primary btn-sm" type="button">Set preferences</button>
+      </div>
 
       <section class="stats" aria-label="Summary">
         <div class="stat">
@@ -120,6 +132,10 @@
       </p>
       <p class="card-price" data-field="price"></p>
       <div class="meter" aria-hidden="true"><span data-field="meter"></span></div>
+      <details class="why" data-field="why" hidden>
+        <summary>Why this score?</summary>
+        <div class="why-body"></div>
+      </details>
       <div class="card-footer">
         <a class="agent" data-field="agent">
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 3h-2A1.5 1.5 0 0 0 3 4.5C3 11.4 8.6 17 15.5 17a1.5 1.5 0 0 0 1.5-1.5v-2l-3.5-1.5-1.5 1.5a8 8 0 0 1-4.5-4.5L9 7.5z"/></svg>
@@ -165,15 +181,30 @@
         </label>
       </div>
 
-      <div class="field-row">
-        <label class="field">
-          <span>Match score <output id="score-output" class="score-output">5 / 10</output></span>
-          <input name="match_score" id="score-input" type="range" min="1" max="10" step="1" value="5">
+      <label class="field">
+        <span>Agent number <em class="optional">optional</em></span>
+        <input name="agent_number" type="tel" maxlength="40" autocomplete="off" placeholder="+1 555 123 4567">
+      </label>
+
+      <div class="field">
+        <span class="field-label">Features it has</span>
+        <div id="feature-checks" class="check-chips"></div>
+        <p id="features-empty" class="hint">Add the features you want under <strong>Preferences</strong>, then tick them here.</p>
+      </div>
+
+      <div class="score-box">
+        <div class="score-box-row">
+          <span class="field-label">Calculated match score</span>
+          <output id="auto-score" class="score-output">–</output>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="override-toggle">
+          <span>Set my own score instead</span>
         </label>
-        <label class="field">
-          <span>Agent number <em class="optional">optional</em></span>
-          <input name="agent_number" type="tel" maxlength="40" autocomplete="off" placeholder="+1 555 123 4567">
-        </label>
+        <div id="override-field" class="override-field" hidden>
+          <input id="score-input" type="range" min="1" max="10" step="1" value="5" aria-label="Your own score">
+          <output id="score-output" class="score-output">5 / 10</output>
+        </div>
       </div>
 
       <p class="form-error" id="property-error" role="alert"></p>
@@ -181,6 +212,92 @@
       <div class="dialog-actions">
         <button type="button" class="btn btn-ghost" data-close>Cancel</button>
         <button type="submit" class="btn btn-primary" id="property-submit">Save property</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Preferences -->
+  <dialog id="prefs-dialog" class="dialog-wide" aria-labelledby="prefs-title">
+    <form id="prefs-form">
+      <div>
+        <h2 id="prefs-title">Your preferences</h2>
+        <p class="muted">
+          Every property is scored 1–10 on how well it matches these. Must-haves count three times as much as
+          nice-to-haves, and a property missing a must-have can't score above 4.
+        </p>
+      </div>
+
+      <section class="pref">
+        <div class="pref-head">
+          <h3>Property types</h3>
+          <select name="types-importance" class="importance" aria-label="Importance of property type">
+            <option value="must">Must-have</option>
+            <option value="important">Important</option>
+            <option value="nice">Nice to have</option>
+          </select>
+        </div>
+        <p class="hint">Pick every type you'd consider.</p>
+        <div id="pref-types" class="check-chips"></div>
+      </section>
+
+      <section class="pref">
+        <div class="pref-head">
+          <h3>Locations</h3>
+          <select name="locations-importance" class="importance" aria-label="Importance of location">
+            <option value="must">Must-have</option>
+            <option value="important">Important</option>
+            <option value="nice">Nice to have</option>
+          </select>
+        </div>
+        <p class="hint">A property matches if its location mentions any of these areas.</p>
+        <div class="add-row">
+          <input id="location-input" type="text" maxlength="80" placeholder="e.g. Riverside" aria-label="Add an area">
+          <button id="location-add" class="btn btn-ghost" type="button">Add</button>
+        </div>
+        <div id="pref-locations" class="tags"></div>
+      </section>
+
+      <section class="pref">
+        <div class="pref-head">
+          <h3>Budget</h3>
+          <select name="budget-importance" class="importance" aria-label="Importance of budget">
+            <option value="must">Must-have</option>
+            <option value="important">Important</option>
+            <option value="nice">Nice to have</option>
+          </select>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Minimum</span>
+            <input name="budget-min" type="number" min="0" step="any" inputmode="decimal" placeholder="No minimum">
+          </label>
+          <label class="field">
+            <span>Maximum</span>
+            <input name="budget-max" type="number" min="0" step="any" inputmode="decimal" placeholder="No maximum">
+          </label>
+        </div>
+        <p class="hint">Prices up to 25% outside your range still get partial credit.</p>
+      </section>
+
+      <section class="pref">
+        <div class="pref-head">
+          <h3>Features</h3>
+        </div>
+        <p class="hint">Each feature counts on its own. You'll tick which ones each property has.</p>
+        <div id="pref-features" class="feature-rows"></div>
+        <p id="features-none" class="hint">No features yet.</p>
+        <div class="add-row">
+          <input id="feature-input" type="text" maxlength="60" placeholder="e.g. Home office" aria-label="Add a feature">
+          <button id="feature-add" class="btn btn-ghost" type="button">Add</button>
+        </div>
+        <div id="feature-suggestions" class="suggestions"></div>
+      </section>
+
+      <p class="form-error" id="prefs-error" role="alert"></p>
+
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary">Save preferences</button>
       </div>
     </form>
   </dialog>

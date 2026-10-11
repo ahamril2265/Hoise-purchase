@@ -129,19 +129,39 @@ async function readJson(request) {
   }
 }
 
+// ---------- Validation helpers ----------
+
+const isBlank = (value) => value === '' || value === null || value === undefined;
+
+/** Trimmed, de-duplicated (case-insensitive) list of non-empty strings. */
+function stringList(value, maxItems, maxLength) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const text = item.trim().slice(0, maxLength);
+    if (!text || seen.has(text.toLowerCase())) continue;
+    seen.add(text.toLowerCase());
+    out.push(text);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
 // ---------- Properties ----------
 
 function parseProperty(body) {
   const str = (value, max) => (typeof value === 'string' ? value.trim() : '').slice(0, max);
-  const num = (value) => (value === '' || value === null || value === undefined ? NaN : Number(value));
 
   const property = {
     name: str(body.name, 120),
     location: str(body.location, 200),
     type: str(body.type, 40),
-    price: num(body.price),
-    match_score: num(body.match_score),
+    price: isBlank(body.price) ? NaN : Number(body.price),
     agent_number: str(body.agent_number, 40),
+    features: stringList(body.features, 30, 60),
+    score_override: isBlank(body.score_override) ? null : Number(body.score_override),
   };
 
   const errors = [];
@@ -149,8 +169,9 @@ function parseProperty(body) {
   if (!property.location) errors.push('Location is required.');
   if (!PROPERTY_TYPES.includes(property.type)) errors.push('Choose a property type.');
   if (!Number.isFinite(property.price) || property.price < 0) errors.push('Price must be a number of 0 or more.');
-  if (!Number.isInteger(property.match_score) || property.match_score < 1 || property.match_score > 10) {
-    errors.push('Match score must be a whole number from 1 to 10.');
+  if (property.score_override !== null
+      && (!Number.isInteger(property.score_override) || property.score_override < 1 || property.score_override > 10)) {
+    errors.push('Your own score must be a whole number from 1 to 10.');
   }
   if (property.agent_number && !/^[0-9+()\-.\s]{3,40}$/.test(property.agent_number)) {
     errors.push('Agent number can only contain digits, spaces and + ( ) - .');
@@ -159,7 +180,59 @@ function parseProperty(body) {
   return property;
 }
 
-const propertyParams = (p) => [p.name, p.location, p.type, p.price, p.match_score, p.agent_number];
+const propertyParams = (p) =>
+  [p.name, p.location, p.type, p.price, p.agent_number, JSON.stringify(p.features), p.score_override];
+
+// ---------- Preferences (drive the automatic match score, calculated in the browser) ----------
+
+const IMPORTANCE_LEVELS = ['must', 'important', 'nice'];
+
+const DEFAULT_PREFERENCES = {
+  types: { items: [], importance: 'important' },
+  locations: { items: [], importance: 'important' },
+  budget: { min: null, max: null, importance: 'must' },
+  features: [],
+};
+
+function parsePreferences(body) {
+  const importance = (value) => (IMPORTANCE_LEVELS.includes(value) ? value : 'important');
+  const money = (value) => {
+    if (isBlank(value)) return null;
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0) throw new HttpError(400, 'Budget amounts must be numbers of 0 or more.');
+    return amount;
+  };
+
+  const budget = { min: money(body.budget?.min), max: money(body.budget?.max), importance: importance(body.budget?.importance) };
+  if (budget.min !== null && budget.max !== null && budget.min > budget.max) {
+    throw new HttpError(400, 'Budget minimum is higher than the maximum.');
+  }
+
+  const features = [];
+  const seen = new Set();
+  for (const feature of Array.isArray(body.features) ? body.features : []) {
+    const name = typeof feature?.name === 'string' ? feature.name.trim().slice(0, 60) : '';
+    if (!name || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    features.push({ name, importance: importance(feature.importance) });
+    if (features.length >= 30) break;
+  }
+
+  return {
+    types: {
+      items: stringList(body.types?.items, PROPERTY_TYPES.length, 40).filter((t) => PROPERTY_TYPES.includes(t)),
+      importance: importance(body.types?.importance),
+    },
+    locations: { items: stringList(body.locations?.items, 20, 80), importance: importance(body.locations?.importance) },
+    budget,
+    features,
+  };
+}
+
+async function getPreferences() {
+  const [row] = await query(`SELECT value FROM settings WHERE key = 'preferences'`);
+  return row ? JSON.parse(row.value) : DEFAULT_PREFERENCES;
+}
 
 // ---------- Routes ----------
 
@@ -221,11 +294,25 @@ async function route(request, method, path) {
   if (key === 'POST properties') {
     const p = parseProperty(await readJson(request));
     const [created] = await query(
-      `INSERT INTO properties (name, location, type, price, match_score, agent_number)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      `INSERT INTO properties (name, location, type, price, agent_number, features, score_override)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7) RETURNING *`,
       propertyParams(p),
     );
     return json(201, created);
+  }
+
+  if (key === 'GET preferences') {
+    return json(200, await getPreferences());
+  }
+
+  if (key === 'PUT preferences') {
+    const preferences = parsePreferences(await readJson(request));
+    await query(
+      `INSERT INTO settings (key, value) VALUES ('preferences', $1)
+       ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+      [JSON.stringify(preferences)],
+    );
+    return json(200, preferences);
   }
 
   const match = path.match(/^properties\/(\d+)$/);
@@ -236,8 +323,9 @@ async function route(request, method, path) {
       const p = parseProperty(await readJson(request));
       const [updated] = await query(
         `UPDATE properties
-         SET name = $1, location = $2, type = $3, price = $4, match_score = $5, agent_number = $6, updated_at = now()
-         WHERE id = $7 RETURNING *`,
+         SET name = $1, location = $2, type = $3, price = $4, agent_number = $5,
+             features = $6::jsonb, score_override = $7, updated_at = now()
+         WHERE id = $8 RETURNING *`,
         [...propertyParams(p), id],
       );
       if (!updated) throw new HttpError(404, 'Property not found.');
