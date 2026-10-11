@@ -43,12 +43,21 @@ function showLogin() {
   document.querySelectorAll('dialog[open]').forEach((d) => d.close());
   state.properties = [];
   $('#app-view').hidden = true;
+  $('#register-view').hidden = true;
   $('#login-view').hidden = false;
   $('#password').focus();
 }
 
+function showRegister() {
+  $('#app-view').hidden = true;
+  $('#login-view').hidden = true;
+  $('#register-view').hidden = false;
+  $('#register-password').focus();
+}
+
 async function showApp() {
   $('#login-view').hidden = true;
+  $('#register-view').hidden = true;
   $('#app-view').hidden = false;
   try {
     state.properties = await api('/api/properties');
@@ -206,6 +215,30 @@ function wireEvents() {
     }
   });
 
+  $('#register-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const { password, confirm } = Object.fromEntries(new FormData(form));
+    $('#register-error').textContent = '';
+    if (password !== confirm) {
+      $('#register-error').textContent = "Passwords don't match.";
+      return;
+    }
+    setBusy(form, true);
+    try {
+      await api('/api/register', { method: 'POST', body: { password } });
+      form.reset();
+      await showApp();
+      toast('Password created');
+    } catch (err) {
+      $('#register-error').textContent = err.message;
+      // Someone already set a password (e.g. from another tab): switch to sign-in.
+      if (/already been set/.test(err.message)) setTimeout(showLogin, 1500);
+    } finally {
+      setBusy(form, false);
+    }
+  });
+
   $('#logout-btn').addEventListener('click', async () => {
     await api('/api/logout', { method: 'POST' }).catch(() => {});
     showLogin();
@@ -318,16 +351,18 @@ function wireEvents() {
 async function init() {
   wireEvents();
   try {
-    const { authenticated, propertyTypes } = await api('/api/session');
+    const { authenticated, registered, propertyTypes } = await api('/api/session');
     state.types = propertyTypes;
     for (const select of [$('#filter-type'), $('#type-select')]) {
       select.append(...propertyTypes.map((t) => new Option(t, t)));
     }
     if (authenticated) await showApp();
+    else if (!registered) showRegister();
     else showLogin();
-  } catch {
+  } catch (err) {
     showLogin();
-    $('#login-error').textContent = "Can't reach the server. Please refresh.";
+    // fetch() throws a TypeError on network failure; anything else is a message from the server.
+    $('#login-error').textContent = err instanceof TypeError ? "Can't reach the server. Please refresh." : err.message;
   }
 }
 

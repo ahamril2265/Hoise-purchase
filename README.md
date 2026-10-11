@@ -3,34 +3,42 @@
 A small password-protected site for keeping track of properties viewed while house hunting.
 Each property stores its name, location, type, price, match score (1–10) and agent number.
 
-No dependencies to install. It needs Node.js 22.13 or newer and uses Node's built-in SQLite.
+Built for Vercel: static files in `public/`, one serverless function in `api/`, data in Neon Postgres.
 
-## Run it
+## Deploy to Vercel
 
-```bash
-npm run set-password -- "choose-a-password"
-npm start
+1. Push this folder to a GitHub repository.
+2. In Vercel, choose **Add New → Project** and import the repository. Leave every setting at its default and deploy.
+3. Open the project's **Storage** tab, choose **Create Database → Neon (Postgres)**, and connect it to the project.
+   This adds the `DATABASE_URL` environment variable automatically.
+4. Go to **Deployments** and **Redeploy** the latest deployment so it picks up the database.
+5. Visit your site. The first visit shows **Create a password**. Set it straight away:
+   once a password exists, registration closes and the site only shows sign-in.
+
+Tables are created automatically on first use.
+
+## Forgot the password?
+
+In the Neon console (Vercel → Storage → your database → **Open in Neon** → SQL Editor), run:
+
+```sql
+DELETE FROM settings WHERE key = 'password_hash';
+DELETE FROM sessions;
 ```
 
-Then open http://localhost:3000.
+The next visit shows **Create a password** again. Your saved properties are kept.
 
-- Run `set-password` again at any time to reset the password. This also signs out every device.
-- Once signed in, the client can change the password from **Change password** in the top bar.
-- All data lives in `data.db`. Back up that file to back up everything.
+## Run locally
 
-## Settings (environment variables)
+```bash
+npm install
+npm run dev
+```
 
-| Variable       | Default       | Purpose                                                          |
-| -------------- | ------------- | ---------------------------------------------------------------- |
-| `PORT`         | `3000`        | Port to listen on                                                |
-| `HOST`         | `127.0.0.1`   | Use `0.0.0.0` when hosting so other devices can reach it         |
-| `DB_PATH`      | `./data.db`   | Where the database file is stored                                |
-| `APP_PASSWORD` | —             | Sets the initial password on first start (handy on hosts with no shell) |
+Then open http://localhost:3000. Without a `DATABASE_URL`, local runs use an in-process Postgres (PGlite)
+saved to `.pglite/`, so you don't need a database account to try it. Set `DATABASE_URL` to use your Neon database instead.
 
-To show a currency symbol with prices, set `CURRENCY` at the top of `public/app.js` (e.g. `'USD'`, `'GBP'`, `'AED'`).
+## Customising
 
-## Hosting for the client
-
-Put it behind HTTPS (most hosts like Render, Railway or a VPS with Caddy/nginx do this for you).
-The session cookie is automatically marked `Secure` when the request arrives over HTTPS.
-Make sure `data.db` is on persistent storage so it survives restarts and redeploys.
+- **Currency symbol:** set `CURRENCY` at the top of `public/app.js` (e.g. `'USD'`, `'GBP'`, `'AED'`).
+- **Property types:** edit `PROPERTY_TYPES` in `api/index.js`.
