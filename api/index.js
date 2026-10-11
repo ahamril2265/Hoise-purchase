@@ -257,8 +257,8 @@ async function route(request, method, path) {
 async function handle(request) {
   try {
     const url = new URL(request.url);
-    // vercel.json rewrites /api/<path> to /api?__route=<path>; fall back to the pathname otherwise.
-    const path = (url.searchParams.get('__route') ?? url.pathname.replace(/^\/api\/?/, '')).replace(/\/+$/, '');
+    // The frontend calls /api?route=<path> (e.g. route=properties/3), which needs no rewrites on Vercel.
+    const path = (url.searchParams.get('route') ?? '').replace(/^\/+|\/+$/g, '');
     return await route(request, request.method, path);
   } catch (err) {
     if (err.code === 'DB_NOT_CONFIGURED') return json(503, { error: err.message });

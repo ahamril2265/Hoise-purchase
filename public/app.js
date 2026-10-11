@@ -21,15 +21,16 @@ const scoreLevel = (score) => (score >= 8 ? 'high' : score >= 5 ? 'mid' : 'low')
 
 // ---------- API ----------
 
-async function api(path, { method = 'GET', body } = {}) {
-  const res = await fetch(path, {
+// All requests go to the single /api function, with the route in the query string (e.g. /api?route=properties/3).
+async function api(route, { method = 'GET', body } = {}) {
+  const res = await fetch(`/api?route=${encodeURIComponent(route)}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
     credentials: 'same-origin',
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && path !== '/api/login') {
+  if (res.status === 401 && route !== 'login') {
     showLogin();
     throw new Error(data.error || 'Please sign in.');
   }
@@ -60,7 +61,7 @@ async function showApp() {
   $('#register-view').hidden = true;
   $('#app-view').hidden = false;
   try {
-    state.properties = await api('/api/properties');
+    state.properties = await api('properties');
     render();
   } catch (err) {
     toast(err.message);
@@ -204,7 +205,7 @@ function wireEvents() {
     $('#login-error').textContent = '';
     setBusy(form, true);
     try {
-      await api('/api/login', { method: 'POST', body: { password: $('#password').value } });
+      await api('login', { method: 'POST', body: { password: $('#password').value } });
       $('#password').value = '';
       await showApp();
     } catch (err) {
@@ -226,7 +227,7 @@ function wireEvents() {
     }
     setBusy(form, true);
     try {
-      await api('/api/register', { method: 'POST', body: { password } });
+      await api('register', { method: 'POST', body: { password } });
       form.reset();
       await showApp();
       toast('Password created');
@@ -240,7 +241,7 @@ function wireEvents() {
   });
 
   $('#logout-btn').addEventListener('click', async () => {
-    await api('/api/logout', { method: 'POST' }).catch(() => {});
+    await api('logout', { method: 'POST' }).catch(() => {});
     showLogin();
   });
 
@@ -291,11 +292,11 @@ function wireEvents() {
     setBusy(form, true);
     try {
       if (state.editingId) {
-        const updated = await api(`/api/properties/${state.editingId}`, { method: 'PUT', body });
+        const updated = await api(`properties/${state.editingId}`, { method: 'PUT', body });
         state.properties = state.properties.map((p) => (p.id === updated.id ? updated : p));
         toast('Changes saved');
       } else {
-        const created = await api('/api/properties', { method: 'POST', body });
+        const created = await api('properties', { method: 'POST', body });
         state.properties.unshift(created);
         toast('Property added');
       }
@@ -313,7 +314,7 @@ function wireEvents() {
     const form = e.currentTarget;
     setBusy(form, true);
     try {
-      await api(`/api/properties/${state.deletingId}`, { method: 'DELETE' });
+      await api(`properties/${state.deletingId}`, { method: 'DELETE' });
       state.properties = state.properties.filter((p) => p.id !== state.deletingId);
       $('#confirm-dialog').close();
       render();
@@ -335,7 +336,7 @@ function wireEvents() {
     }
     setBusy(form, true);
     try {
-      await api('/api/password', { method: 'POST', body: { current, next } });
+      await api('password', { method: 'POST', body: { current, next } });
       $('#password-dialog').close();
       toast('Password updated');
     } catch (err) {
@@ -351,7 +352,7 @@ function wireEvents() {
 async function init() {
   wireEvents();
   try {
-    const { authenticated, registered, propertyTypes } = await api('/api/session');
+    const { authenticated, registered, propertyTypes } = await api('session');
     state.types = propertyTypes;
     for (const select of [$('#filter-type'), $('#type-select')]) {
       select.append(...propertyTypes.map((t) => new Option(t, t)));
